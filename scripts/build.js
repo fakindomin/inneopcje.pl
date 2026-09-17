@@ -120,7 +120,7 @@ async function run() {
         await generateSeeds(pool, category);
       } catch (err) {
         console.error(`build: generate-seeds failed, will retry next run: ${err.message}`);
-        await finishRun(pool, runId, { status: "failed" });
+        await finishRun(pool, runId, { status: "failed", note: err.message });
         return;
       }
       await sleep(GEMINI_CALL_DELAY_MS);
@@ -132,6 +132,8 @@ async function run() {
       await finishRun(pool, runId, { status: "success" });
       return;
     }
+
+    let lastItemError = null;
 
     for (const item of queue) {
       try {
@@ -151,8 +153,12 @@ async function run() {
         stats[status]++;
         console.log(`build: ${status} "${item.product_name}" -> ${product.slug} (${linked} alternatives linked)`);
       } catch (err) {
-        await pool.query(`UPDATE seed_queue SET status = 'failed' WHERE id = $1`, [item.id]);
+        await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
+          item.id,
+          err.message,
+        ]);
         stats.failed++;
+        lastItemError = err.message;
         console.error(`build: failed "${item.product_name}": ${err.message}`);
       }
 
@@ -160,9 +166,13 @@ async function run() {
     }
 
     console.log(`build: done — published=${stats.published} draft=${stats.draft} failed=${stats.failed}`);
-    await finishRun(pool, runId, { status: "success", ...stats });
+    await finishRun(pool, runId, {
+      status: "success",
+      ...stats,
+      note: stats.failed > 0 ? `ostatni błąd pozycji: ${lastItemError}` : null,
+    });
   } catch (err) {
-    if (runId) await finishRun(pool, runId, { status: "failed", ...stats });
+    if (runId) await finishRun(pool, runId, { status: "failed", ...stats, note: err.message });
     throw err;
   } finally {
     await pool.end();
