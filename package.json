@@ -1,0 +1,14 @@
+{
+  "name": "innaopcja-bot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Automated product-database builder for innaopcja.pl. Runs on a GitHub Actions schedule, uses Gemini to research products, and writes into the same Neon Postgres database as the live site.",
+  "scripts": {
+    "build": "node scripts/build.js"
+  },
+  "dependencies": {
+    "@google/genai": "^2.22.0",
+    "pg": "^8.23.0"
+  }
+}
