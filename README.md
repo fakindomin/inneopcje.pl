@@ -18,7 +18,7 @@ Each run (`scripts/build.js`):
 2. Pulls up to 25 `pending` rows from `seed_queue` for that category. If the queue is
    empty, it asks Gemini for 40 new candidate product names first
    (`scripts/generate-seeds.js`), deduped against existing products and queue rows.
-3. For each queued product name, asks Gemini (`gemini-2.5-flash`, JSON mode) to evaluate
+3. For each queued product name, asks Gemini (`gemini-3.6-flash`, JSON mode) to evaluate
    it: verdict, score, summary, pros/cons, specs (always includes
    `specs.price_pln_approx`), brand, brand recognition, price tier, and a `confidence`
    flag.
