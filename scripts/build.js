@@ -7,15 +7,21 @@ import { generateSeeds } from "./generate-seeds.js";
 
 // Confirmed on aistudio.google.com/rate-limit for this project:
 // gemini-3.5-flash-lite free tier = 500 RPD, 15 RPM. 450 leaves the same
-// ~10% margin odbaitujto uses for the same model/tier. At ~4.2s/call that's
-// ~32 minutes — see the matching timeout-minutes bump in
-// .github/workflows/build-database.yml.
+// ~10% margin odbaitujto uses for the same model/tier.
 const BATCH_SIZE = 450;
 const SCORE_MIN = 1;
 const SCORE_MAX = 10;
 const VALID_BRAND_RECOGNITION = new Set(["mainstream", "niche"]);
 const VALID_PRICE_TIER = new Set(["budzetowy", "sredni", "premium"]);
 const VALID_CONFIDENCE = new Set(["wysoka", "niska"]);
+
+// One cron firing keeps looping through categories — refilling and
+// processing batches — until it genuinely runs out of runway: the daily
+// Gemini quota, a full lap through every category with nothing new to add,
+// or the job's own time budget. This is what makes "use the whole day's
+// quota" automatic instead of needing someone to keep re-triggering it.
+const JOB_TIME_BUDGET_MS = 38 * 60 * 1000; // leave ~2 min under timeout-minutes: 40
+const MAX_LOOP_ITERATIONS = 200; // absolute safety net, independent of the above
 
 function validateEvaluation(data) {
   if (!data || typeof data !== "object") return "response is not an object";
@@ -97,10 +103,110 @@ async function linkAlternatives(pool, categoryId, product) {
   return alternatives.length;
 }
 
+// Evaluates every item in `queue`, inserting/linking as it goes. Stops
+// immediately (leaving the rest of `queue` untouched, still 'pending') if
+// Gemini reports the daily quota is exhausted.
+async function processBatch(pool, category, categoryId, queue) {
+  const stats = { published: 0, draft: 0, failed: 0 };
+  let lastItemError = null;
+  let quotaExhausted = false;
+
+  for (const item of queue) {
+    try {
+      const evaluation = await evaluateProduct(category, item.product_name);
+      const error = validateEvaluation(evaluation);
+      if (error) throw new Error(`invalid Gemini response: ${error}`);
+
+      const status = evaluation.confidence === "wysoka" ? "published" : "draft";
+      const product = await insertProduct(pool, categoryId, item.product_name, evaluation, status);
+
+      let linked = 0;
+      if (status === "published") {
+        linked = await linkAlternatives(pool, categoryId, product);
+      }
+
+      await pool.query(`UPDATE seed_queue SET status = 'done' WHERE id = $1`, [item.id]);
+      stats[status]++;
+      console.log(`build: ${status} "${item.product_name}" -> ${product.slug} (${linked} alternatives linked)`);
+    } catch (err) {
+      if (isQuotaError(err)) {
+        console.error(`build: Gemini daily quota exhausted, stopping batch early: ${err.message}`);
+        quotaExhausted = true;
+        break;
+      }
+
+      await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
+        item.id,
+        err.message,
+      ]);
+      stats.failed++;
+      lastItemError = err.message;
+      console.error(`build: failed "${item.product_name}": ${err.message}`);
+    }
+
+    await sleep(GEMINI_CALL_DELAY_MS);
+  }
+
+  return { stats, quotaExhausted, lastItemError };
+}
+
+// One category's worth of work for this pass: refill the queue if empty,
+// process whatever's there, log a bot_runs row. Returns whether it actually
+// did anything (so the outer loop can tell "nothing left anywhere" apart
+// from "just this category was empty") and whether quota ran out.
+async function runOneCategoryCycle(pool) {
+  const category = await pickCurrentCategory(pool);
+  const { rows: categoryRows } = await pool.query(`SELECT id FROM categories WHERE slug = $1`, [category]);
+  const categoryId = categoryRows[0]?.id;
+  if (!categoryId) {
+    console.error(`build: category "${category}" not found, skipping`);
+    return { didWork: false, quotaExhausted: false };
+  }
+
+  const runId = await startRun(pool, category);
+  console.log(`build: cycle scoped to category "${category}" (run ${runId})`);
+
+  let queue = await fetchQueueBatch(pool, category);
+  if (queue.length === 0) {
+    try {
+      await generateSeeds(pool, category);
+    } catch (err) {
+      if (isQuotaError(err)) {
+        await finishRun(pool, runId, { status: "failed", note: err.message });
+        return { didWork: false, quotaExhausted: true };
+      }
+      console.error(`build: generate-seeds failed, will retry next cycle: ${err.message}`);
+      await finishRun(pool, runId, { status: "failed", note: err.message });
+      return { didWork: false, quotaExhausted: false };
+    }
+    await sleep(GEMINI_CALL_DELAY_MS);
+    queue = await fetchQueueBatch(pool, category);
+  }
+
+  if (queue.length === 0) {
+    console.log(`build: nothing to do for "${category}" (queue still empty after refill)`);
+    await finishRun(pool, runId, { status: "success" });
+    return { didWork: false, quotaExhausted: false };
+  }
+
+  const { stats, quotaExhausted, lastItemError } = await processBatch(pool, category, categoryId, queue);
+
+  console.log(`build: "${category}" done — published=${stats.published} draft=${stats.draft} failed=${stats.failed}`);
+  await finishRun(pool, runId, {
+    status: quotaExhausted ? "failed" : "success",
+    ...stats,
+    note: quotaExhausted
+      ? "Gemini: wyczerpany dzienny limit (RESOURCE_EXHAUSTED) — przerwano cykl wcześniej, reszta kolejki zostaje w 'pending'"
+      : stats.failed > 0
+      ? `ostatni błąd pozycji: ${lastItemError}`
+      : null,
+  });
+
+  return { didWork: true, quotaExhausted };
+}
+
 async function run() {
   const pool = getPool();
-  const stats = { published: 0, draft: 0, failed: 0 };
-  let runId;
 
   try {
     await ensureSchema(pool);
@@ -111,89 +217,37 @@ async function run() {
       return;
     }
 
-    const category = await pickCurrentCategory(pool);
-    console.log(`build: run scoped to category "${category}"`);
-    runId = await startRun(pool, category);
+    const { rows: categoryRows } = await pool.query(`SELECT slug FROM categories WHERE parent_id IS NULL`);
+    const categoryCount = Math.max(categoryRows.length, 1);
 
-    const { rows: categoryRows } = await pool.query(`SELECT id FROM categories WHERE slug = $1`, [category]);
-    const categoryId = categoryRows[0]?.id;
-    if (!categoryId) throw new Error(`category "${category}" not found`);
+    const jobStart = Date.now();
+    let consecutiveEmptyCycles = 0;
+    let iterations = 0;
 
-    let queue = await fetchQueueBatch(pool, category);
-    if (queue.length === 0) {
-      try {
-        await generateSeeds(pool, category);
-      } catch (err) {
-        console.error(`build: generate-seeds failed, will retry next run: ${err.message}`);
-        await finishRun(pool, runId, { status: "failed", note: err.message });
-        return;
+    while (true) {
+      iterations++;
+      if (iterations > MAX_LOOP_ITERATIONS) {
+        console.log("build: hit the absolute iteration safety cap, stopping");
+        break;
       }
-      await sleep(GEMINI_CALL_DELAY_MS);
-      queue = await fetchQueueBatch(pool, category);
-    }
-
-    if (queue.length === 0) {
-      console.log("build: nothing to do (queue still empty after refill)");
-      await finishRun(pool, runId, { status: "success" });
-      return;
-    }
-
-    let lastItemError = null;
-    let quotaExhausted = false;
-
-    for (const item of queue) {
-      try {
-        const evaluation = await evaluateProduct(category, item.product_name);
-        const error = validateEvaluation(evaluation);
-        if (error) throw new Error(`invalid Gemini response: ${error}`);
-
-        const status = evaluation.confidence === "wysoka" ? "published" : "draft";
-        const product = await insertProduct(pool, categoryId, item.product_name, evaluation, status);
-
-        let linked = 0;
-        if (status === "published") {
-          linked = await linkAlternatives(pool, categoryId, product);
-        }
-
-        await pool.query(`UPDATE seed_queue SET status = 'done' WHERE id = $1`, [item.id]);
-        stats[status]++;
-        console.log(`build: ${status} "${item.product_name}" -> ${product.slug} (${linked} alternatives linked)`);
-      } catch (err) {
-        if (isQuotaError(err)) {
-          // Daily quota, not a rate limit — retrying more items today is
-          // hopeless. Leave this item (and the rest of the batch) pending
-          // so they're picked up automatically once the quota resets,
-          // instead of burning the job timeout retrying each one.
-          console.error(`build: Gemini daily quota exhausted, stopping batch early: ${err.message}`);
-          quotaExhausted = true;
-          break;
-        }
-
-        await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
-          item.id,
-          err.message,
-        ]);
-        stats.failed++;
-        lastItemError = err.message;
-        console.error(`build: failed "${item.product_name}": ${err.message}`);
+      if (Date.now() - jobStart > JOB_TIME_BUDGET_MS) {
+        console.log("build: approaching the job's time budget, stopping cleanly");
+        break;
+      }
+      if (consecutiveEmptyCycles >= categoryCount) {
+        console.log("build: full lap through every category with nothing new to do — stopping for now");
+        break;
       }
 
-      await sleep(GEMINI_CALL_DELAY_MS);
-    }
+      const { didWork, quotaExhausted } = await runOneCategoryCycle(pool);
 
-    console.log(`build: done — published=${stats.published} draft=${stats.draft} failed=${stats.failed}`);
-    await finishRun(pool, runId, {
-      status: quotaExhausted ? "failed" : "success",
-      ...stats,
-      note: quotaExhausted
-        ? "Gemini: wyczerpany dzienny limit (RESOURCE_EXHAUSTED) — przerwano przebieg wcześniej, reszta kolejki zostaje w 'pending'"
-        : stats.failed > 0
-        ? `ostatni błąd pozycji: ${lastItemError}`
-        : null,
-    });
-  } catch (err) {
-    if (runId) await finishRun(pool, runId, { status: "failed", ...stats, note: err.message });
-    throw err;
+      if (quotaExhausted) {
+        console.log("build: stopping — Gemini daily quota exhausted");
+        break;
+      }
+
+      consecutiveEmptyCycles = didWork ? 0 : consecutiveEmptyCycles + 1;
+    }
   } finally {
     await pool.end();
   }
