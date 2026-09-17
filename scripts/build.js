@@ -1,6 +1,6 @@
 import { getPool } from "../lib/db.js";
 import { ensureSchema, isBotEnabled, pickCurrentCategory, startRun, finishRun, logSkippedRun } from "../lib/schema.js";
-import { evaluateProduct, GEMINI_CALL_DELAY_MS, sleep } from "../lib/gemini.js";
+import { evaluateProduct, GEMINI_CALL_DELAY_MS, sleep, isQuotaError } from "../lib/gemini.js";
 import { normalizeName, slugify, uniqueSlug } from "../lib/slugify.js";
 import { computeAlternatives } from "../lib/matching.js";
 import { generateSeeds } from "./generate-seeds.js";
@@ -134,6 +134,7 @@ async function run() {
     }
 
     let lastItemError = null;
+    let quotaExhausted = false;
 
     for (const item of queue) {
       try {
@@ -153,6 +154,16 @@ async function run() {
         stats[status]++;
         console.log(`build: ${status} "${item.product_name}" -> ${product.slug} (${linked} alternatives linked)`);
       } catch (err) {
+        if (isQuotaError(err)) {
+          // Daily quota, not a rate limit — retrying more items today is
+          // hopeless. Leave this item (and the rest of the batch) pending
+          // so they're picked up automatically once the quota resets,
+          // instead of burning the job timeout retrying each one.
+          console.error(`build: Gemini daily quota exhausted, stopping batch early: ${err.message}`);
+          quotaExhausted = true;
+          break;
+        }
+
         await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
           item.id,
           err.message,
@@ -167,9 +178,13 @@ async function run() {
 
     console.log(`build: done — published=${stats.published} draft=${stats.draft} failed=${stats.failed}`);
     await finishRun(pool, runId, {
-      status: "success",
+      status: quotaExhausted ? "failed" : "success",
       ...stats,
-      note: stats.failed > 0 ? `ostatni błąd pozycji: ${lastItemError}` : null,
+      note: quotaExhausted
+        ? "Gemini: wyczerpany dzienny limit (RESOURCE_EXHAUSTED) — przerwano przebieg wcześniej, reszta kolejki zostaje w 'pending'"
+        : stats.failed > 0
+        ? `ostatni błąd pozycji: ${lastItemError}`
+        : null,
     });
   } catch (err) {
     if (runId) await finishRun(pool, runId, { status: "failed", ...stats, note: err.message });
