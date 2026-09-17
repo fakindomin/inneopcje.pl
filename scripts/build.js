@@ -5,7 +5,11 @@ import { normalizeName, slugify, uniqueSlug } from "../lib/slugify.js";
 import { computeAlternatives } from "../lib/matching.js";
 import { generateSeeds } from "./generate-seeds.js";
 
-const BATCH_SIZE = 25;
+// gemini-3.5-flash-lite's free tier is ~500 requests/day (see lib/gemini.js).
+// 100/run @ ~4.2s/call is ~7 minutes, comfortably under the 15-minute job
+// timeout, and leaves a wide margin below the observed daily quota in case
+// this specific account's real number is lower than 500.
+const BATCH_SIZE = 100;
 const SCORE_MIN = 1;
 const SCORE_MAX = 10;
 const VALID_BRAND_RECOGNITION = new Set(["mainstream", "niche"]);
