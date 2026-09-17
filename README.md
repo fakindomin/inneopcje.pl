@@ -13,8 +13,13 @@ app or its deploy pipeline.
 
 Each run (`scripts/build.js`):
 
-1. Picks the category for this run — alternates between `telefony` and `telewizory` on
-   every invocation (state kept in the `bot_state` table, key `last_category`).
+0. Checks `bot_state` (key `enabled`) — if it's `'false'`, the run is a no-op: it logs a
+   `skipped` row in `bot_runs` and exits. This is how the "Stop"/"Start" toggle in the
+   innaopcja.pl admin panel (`/admin`) controls the bot without needing GitHub Actions
+   API access — the schedule keeps firing, but does nothing while paused.
+1. Picks the category for this run — round-robins over every top-level row in
+   `categories` (state kept in the `bot_state` table, key `last_category`), so a category
+   added later via the admin panel is picked up automatically, no code change needed.
 2. Pulls up to 25 `pending` rows from `seed_queue` for that category. If the queue is
    empty, it asks Gemini for 40 new candidate product names first
    (`scripts/generate-seeds.js`), deduped against existing products and queue rows.
@@ -32,9 +37,13 @@ Each run (`scripts/build.js`):
    `lib/matching.js`.
 6. Waits ~4.2s between Gemini calls (free tier is capped at 15 requests/minute).
 
-Everything is idempotent: `lib/schema.js` creates `seed_queue` and `bot_state` with
-`CREATE TABLE IF NOT EXISTS` on every run, and makes sure the `telewizory` category
-exists, so there's no separate migration step to remember to run.
+Every invocation also writes one row to `bot_runs` (category, status, published/draft/
+failed counts, started/finished timestamps) — this is what the admin panel reads to show
+"did it run today" and recent history, without calling the GitHub Actions API.
+
+Everything is idempotent: `lib/schema.js` creates `seed_queue`, `bot_state`, and
+`bot_runs` with `CREATE TABLE IF NOT EXISTS` on every run, and makes sure the
+`telewizory` category exists, so there's no separate migration step to remember to run.
 
 ## Setup
 

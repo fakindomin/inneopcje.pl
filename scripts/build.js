@@ -1,5 +1,5 @@
 import { getPool } from "../lib/db.js";
-import { ensureSchema, pickCurrentCategory } from "../lib/schema.js";
+import { ensureSchema, isBotEnabled, pickCurrentCategory, startRun, finishRun, logSkippedRun } from "../lib/schema.js";
 import { evaluateProduct, GEMINI_CALL_DELAY_MS, sleep } from "../lib/gemini.js";
 import { normalizeName, slugify, uniqueSlug } from "../lib/slugify.js";
 import { computeAlternatives } from "../lib/matching.js";
@@ -95,11 +95,20 @@ async function linkAlternatives(pool, categoryId, product) {
 async function run() {
   const pool = getPool();
   const stats = { published: 0, draft: 0, failed: 0 };
+  let runId;
 
   try {
     await ensureSchema(pool);
+
+    if (!(await isBotEnabled(pool))) {
+      console.log("build: bot is disabled in bot_state (paused from the admin panel) — skipping");
+      await logSkippedRun(pool);
+      return;
+    }
+
     const category = await pickCurrentCategory(pool);
     console.log(`build: run scoped to category "${category}"`);
+    runId = await startRun(pool, category);
 
     const { rows: categoryRows } = await pool.query(`SELECT id FROM categories WHERE slug = $1`, [category]);
     const categoryId = categoryRows[0]?.id;
@@ -111,6 +120,7 @@ async function run() {
         await generateSeeds(pool, category);
       } catch (err) {
         console.error(`build: generate-seeds failed, will retry next run: ${err.message}`);
+        await finishRun(pool, runId, { status: "failed" });
         return;
       }
       await sleep(GEMINI_CALL_DELAY_MS);
@@ -119,6 +129,7 @@ async function run() {
 
     if (queue.length === 0) {
       console.log("build: nothing to do (queue still empty after refill)");
+      await finishRun(pool, runId, { status: "success" });
       return;
     }
 
@@ -149,6 +160,10 @@ async function run() {
     }
 
     console.log(`build: done — published=${stats.published} draft=${stats.draft} failed=${stats.failed}`);
+    await finishRun(pool, runId, { status: "success", ...stats });
+  } catch (err) {
+    if (runId) await finishRun(pool, runId, { status: "failed", ...stats });
+    throw err;
   } finally {
     await pool.end();
   }
