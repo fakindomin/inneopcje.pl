@@ -107,7 +107,12 @@ async function run() {
 
     let queue = await fetchQueueBatch(pool, category);
     if (queue.length === 0) {
-      await generateSeeds(pool, category);
+      try {
+        await generateSeeds(pool, category);
+      } catch (err) {
+        console.error(`build: generate-seeds failed, will retry next run: ${err.message}`);
+        return;
+      }
       await sleep(GEMINI_CALL_DELAY_MS);
       queue = await fetchQueueBatch(pool, category);
     }
