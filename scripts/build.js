@@ -5,11 +5,12 @@ import { normalizeName, slugify, uniqueSlug } from "../lib/slugify.js";
 import { computeAlternatives } from "../lib/matching.js";
 import { generateSeeds } from "./generate-seeds.js";
 
-// gemini-3.5-flash-lite's free tier is ~500 requests/day (see lib/gemini.js).
-// 100/run @ ~4.2s/call is ~7 minutes, comfortably under the 15-minute job
-// timeout, and leaves a wide margin below the observed daily quota in case
-// this specific account's real number is lower than 500.
-const BATCH_SIZE = 100;
+// Confirmed on aistudio.google.com/rate-limit for this project:
+// gemini-3.5-flash-lite free tier = 500 RPD, 15 RPM. 450 leaves the same
+// ~10% margin odbaitujto uses for the same model/tier. At ~4.2s/call that's
+// ~32 minutes — see the matching timeout-minutes bump in
+// .github/workflows/build-database.yml.
+const BATCH_SIZE = 450;
 const SCORE_MIN = 1;
 const SCORE_MAX = 10;
 const VALID_BRAND_RECOGNITION = new Set(["mainstream", "niche"]);
