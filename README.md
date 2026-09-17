@@ -11,35 +11,40 @@ app or its deploy pipeline.
 
 ## How it works
 
-Each run (`scripts/build.js`):
+One cron firing (`scripts/build.js`) doesn't stop after one category or one small
+batch — it keeps looping, spending as much of the day's Gemini quota as it can:
 
-0. Checks `bot_state` (key `enabled`) — if it's `'false'`, the run is a no-op: it logs a
-   `skipped` row in `bot_runs` and exits. This is how the "Stop"/"Start" toggle in the
-   innaopcja.pl admin panel (`/admin`) controls the bot without needing GitHub Actions
-   API access — the schedule keeps firing, but does nothing while paused.
-1. Picks the category for this run — round-robins over every top-level row in
-   `categories` (state kept in the `bot_state` table, key `last_category`), so a category
-   added later via the admin panel is picked up automatically, no code change needed.
-2. Pulls up to 25 `pending` rows from `seed_queue` for that category. If the queue is
-   empty, it asks Gemini for 40 new candidate product names first
-   (`scripts/generate-seeds.js`), deduped against existing products and queue rows.
-3. For each queued product name, asks Gemini (`gemini-3.5-flash-lite`, JSON mode) to
-   evaluate it: verdict, score, summary, pros/cons, specs (always includes
-   `specs.price_pln_approx`), brand, brand recognition, price tier, and a `confidence`
-   flag.
-4. Inserts the product as `published` when `confidence` is `wysoka`, or `draft`
-   otherwise. Low-confidence/malformed responses never overwrite existing data — the
-   row is just marked `failed` in the queue and skipped.
-5. For newly `published` products, computes up to 3 "Inna Opcja" alternatives
-   (`tansza` / `wyzsza_jakosc` / `niszowa_marka`) against other published products in
-   the same category, using price (`specs.price_pln_approx`) and `price_tier`/`score` as
-   fallback. A slot is left empty rather than filled with a bad match — see
-   `lib/matching.js`.
-6. Waits ~4.2s between Gemini calls (free tier is capped at 15 requests/minute).
+0. Checks `bot_state` (key `enabled`) — if it's `'false'`, the whole run is a no-op: it
+   logs a `skipped` row in `bot_runs` and exits. This is how the "Stop"/"Start" toggle in
+   the innaopcja.pl admin panel (`/admin`) controls the bot without needing GitHub
+   Actions API access — the schedule keeps firing, but does nothing while paused.
+1. Otherwise, it loops. Each pass through the loop:
+   - Picks the next category — round-robins over every top-level row in `categories`
+     (state kept in `bot_state`, key `last_category`), so a category added later via the
+     admin panel joins the rotation automatically, no code change needed.
+   - Pulls up to `BATCH_SIZE` (450) `pending` rows from `seed_queue` for that category.
+     If empty, asks Gemini for 40 new candidate names first (`scripts/generate-seeds.js`,
+     deduped against existing products and queue rows), then re-checks.
+   - For each queued name, asks Gemini (`gemini-3.5-flash-lite`, JSON mode) to evaluate
+     it: verdict, score, summary, pros/cons, specs (always includes
+     `specs.price_pln_approx`), brand, brand recognition, price tier, and a `confidence`
+     flag. Published when `confidence` is `wysoka`, `draft` otherwise — low-confidence or
+     malformed responses never overwrite existing data.
+   - For newly `published` products, computes up to 3 "Inna Opcja" alternatives
+     (`tansza` / `wyzsza_jakosc` / `niszowa_marka`) against other published products in
+     the same category — see `lib/matching.js`. A slot is left empty rather than filled
+     with a bad match.
+   - Logs one `bot_runs` row for that category's pass (published/draft/failed counts).
+2. The loop itself stops when: Gemini reports the daily quota is exhausted
+   (`RESOURCE_EXHAUSTED`), a full lap through every category adds nothing new (e.g.
+   Gemini keeps suggesting names that already exist), the job's own time budget runs out
+   (38 min, under the 40-minute workflow timeout), or an absolute safety cap (200 loop
+   iterations) is hit.
+3. Waits ~4.2s between individual Gemini calls throughout (free tier RPM cap).
 
-Every invocation also writes one row to `bot_runs` (category, status, published/draft/
-failed counts, started/finished timestamps) — this is what the admin panel reads to show
-"did it run today" and recent history, without calling the GitHub Actions API.
+`bot_runs` (one row per category pass, not per cron firing) is what the admin panel reads
+to show "did it run today," recent history, and live status — without calling the GitHub
+Actions API.
 
 Everything is idempotent: `lib/schema.js` creates `seed_queue`, `bot_state`, and
 `bot_runs` with `CREATE TABLE IF NOT EXISTS` on every run, and makes sure the
@@ -66,11 +71,6 @@ node --env-file=.env scripts/build.js
 
 ## Known limitations / follow-ups
 
-- **`telewizory` has no page on the site yet.** The website currently only serves
-  `/telefon/[slug]`, and search always redirects there regardless of category. TV
-  products this bot publishes will exist in the database and be findable via search,
-  but need a `/telewizor/[slug]` route (or a category-aware route) on the site side to
-  be presented correctly.
 - Alternative matching only computes **outgoing** slots for the product just inserted.
   It doesn't retroactively revisit older products' slots even if a newer, better-fitting
   candidate shows up later — that'd need a periodic re-matching pass.
