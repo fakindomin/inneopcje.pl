@@ -2,8 +2,12 @@ name: Build product database
 
 on:
   schedule:
-    # 06:00 UTC daily
-    - cron: "0 6 * * *"
+    # 09:00 UTC daily — confirmed live that the free-tier daily quota does NOT
+    # reset at UTC midnight (a 06:00 UTC run hit RESOURCE_EXHAUSTED from the
+    # previous day's usage). Google's quotas commonly reset at US Pacific
+    # midnight, which is 07:00 UTC (PDT) or 08:00 UTC (PST) — 09:00 UTC stays
+    # safely after that reset year-round regardless of daylight saving.
+    - cron: "0 9 * * *"
   workflow_dispatch: {}
 
 jobs:

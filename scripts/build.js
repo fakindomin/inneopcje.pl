@@ -1,6 +1,6 @@
 import { getPool } from "../lib/db.js";
 import { ensureSchema, isBotEnabled, pickCurrentCategory, startRun, finishRun, logSkippedRun } from "../lib/schema.js";
-import { evaluateProduct, GEMINI_CALL_DELAY_MS, sleep, isQuotaError } from "../lib/gemini.js";
+import { evaluateProduct, GEMINI_CALL_DELAY_MS, sleep, isQuotaError, minAllowedReleaseYear } from "../lib/gemini.js";
 import { normalizeName, slugify, uniqueSlug } from "../lib/slugify.js";
 import { computeAlternatives } from "../lib/matching.js";
 import { normalizeBrand } from "../lib/brands.js";
@@ -44,6 +44,11 @@ function validateEvaluation(data, category) {
   data.brand = canonicalBrand;
   if (!VALID_BRAND_RECOGNITION.has(data.brand_recognition)) return "invalid brand_recognition";
   if (!VALID_PRICE_TIER.has(data.price_tier)) return "invalid price_tier";
+  const releaseYear = Number(data.release_year);
+  const minYear = minAllowedReleaseYear();
+  if (!Number.isFinite(releaseYear)) return "missing release_year";
+  if (releaseYear < minYear) return `release_year ${releaseYear} is older than the allowed window (${minYear}+)`;
+  if (releaseYear > new Date().getFullYear() + 1) return `release_year ${releaseYear} is implausibly far in the future`;
   if (!VALID_CONFIDENCE.has(data.confidence)) return "invalid confidence";
   return null;
 }
