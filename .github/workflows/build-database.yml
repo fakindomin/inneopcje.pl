@@ -2,12 +2,14 @@ name: Build product database
 
 on:
   schedule:
-    # 09:00 UTC daily — confirmed live that the free-tier daily quota does NOT
-    # reset at UTC midnight (a 06:00 UTC run hit RESOURCE_EXHAUSTED from the
-    # previous day's usage). Google's quotas commonly reset at US Pacific
-    # midnight, which is 07:00 UTC (PDT) or 08:00 UTC (PST) — 09:00 UTC stays
-    # safely after that reset year-round regardless of daylight saving.
-    - cron: "0 9 * * *"
+    # Hourly, not a single guessed daily time. Confirmed live that the
+    # free-tier daily quota doesn't reset at UTC midnight, and rather than
+    # pin a specific hour and hope it's right, each run just checks whether
+    # there's quota to use (build.js exits in seconds if not — see
+    # QuotaExceededError in lib/gemini.js) and does nothing if there isn't.
+    # Whichever hourly tick lands after the actual reset picks up the full
+    # day's quota automatically, no guessing needed.
+    - cron: "0 * * * *"
   workflow_dispatch: {}
 
 jobs:

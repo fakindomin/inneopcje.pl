@@ -59,8 +59,9 @@ Everything is idempotent: `lib/schema.js` creates `seed_queue`, `bot_state`, and
    - `NEON_DATABASE_URL` — the **same** Neon connection string the `innaopcja.pl` site
      uses (its `DATABASE_URL` in `.env.local`). Using the same value is intentional:
      this bot writes into the live site's database.
-3. The workflow runs daily at 06:00 UTC, or on demand via *Actions → Build product
-   database → Run workflow*.
+3. The workflow runs every hour, or on demand via *Actions → Build product database →
+   Run workflow*. Most hourly ticks on a day whose quota is already used up exit in
+   seconds — only the tick that lands after the daily reset does real work.
 
 For local testing, copy `.env.example` to `.env`, fill in both values, then:
 
