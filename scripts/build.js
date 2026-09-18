@@ -3,6 +3,7 @@ import { ensureSchema, isBotEnabled, pickCurrentCategory, startRun, finishRun, l
 import { evaluateProduct, GEMINI_CALL_DELAY_MS, sleep, isQuotaError } from "../lib/gemini.js";
 import { normalizeName, slugify, uniqueSlug } from "../lib/slugify.js";
 import { computeAlternatives } from "../lib/matching.js";
+import { normalizeBrand } from "../lib/brands.js";
 import { generateSeeds } from "./generate-seeds.js";
 
 // Confirmed on aistudio.google.com/rate-limit for this project:
@@ -23,7 +24,9 @@ const VALID_CONFIDENCE = new Set(["wysoka", "niska"]);
 const JOB_TIME_BUDGET_MS = 38 * 60 * 1000; // leave ~2 min under timeout-minutes: 40
 const MAX_LOOP_ITERATIONS = 200; // absolute safety net, independent of the above
 
-function validateEvaluation(data) {
+// Mutates data.brand to the canonical allowlisted spelling on success (fixes
+// Vivo/vivo-style casing duplicates) — that's why this isn't a pure function.
+function validateEvaluation(data, category) {
   if (!data || typeof data !== "object") return "response is not an object";
   if (typeof data.verdict !== "string" || !data.verdict.trim()) return "missing verdict";
   const score = Number(data.score);
@@ -36,6 +39,9 @@ function validateEvaluation(data) {
     return "missing specs.price_pln_approx";
   }
   if (typeof data.brand !== "string" || !data.brand.trim()) return "missing brand";
+  const canonicalBrand = normalizeBrand(category, data.brand);
+  if (!canonicalBrand) return `brand "${data.brand}" is outside the allowed list for "${category}"`;
+  data.brand = canonicalBrand;
   if (!VALID_BRAND_RECOGNITION.has(data.brand_recognition)) return "invalid brand_recognition";
   if (!VALID_PRICE_TIER.has(data.price_tier)) return "invalid price_tier";
   if (!VALID_CONFIDENCE.has(data.confidence)) return "invalid confidence";
@@ -114,7 +120,7 @@ async function processBatch(pool, category, categoryId, queue) {
   for (const item of queue) {
     try {
       const evaluation = await evaluateProduct(category, item.product_name);
-      const error = validateEvaluation(evaluation);
+      const error = validateEvaluation(evaluation, category);
       if (error) throw new Error(`invalid Gemini response: ${error}`);
 
       const status = evaluation.confidence === "wysoka" ? "published" : "draft";
