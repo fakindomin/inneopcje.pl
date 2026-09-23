@@ -2,14 +2,15 @@ name: Build product database
 
 on:
   schedule:
-    # Hourly, not a single guessed daily time. Confirmed live that the
-    # free-tier daily quota doesn't reset at UTC midnight, and rather than
-    # pin a specific hour and hope it's right, each run just checks whether
-    # there's quota to use (build.js exits in seconds if not — see
-    # QuotaExceededError in lib/gemini.js) and does nothing if there isn't.
-    # Whichever hourly tick lands after the actual reset picks up the full
-    # day's quota automatically, no guessing needed.
-    - cron: "0 * * * *"
+    # Weekly, not hourly - new phone/TV models don't appear often enough to
+    # justify spending Gemini quota checking for them every hour (that
+    # budget is better spent on the live per-view price refresh instead,
+    # see app/api/phone/[slug]/price/route.js in the innaopcja.pl repo).
+    # Runs Monday at 03:00 UTC, low-traffic and no particular deadline to
+    # hit - unlike the price refresh, discovery has no reason to land at
+    # any specific time. Still fine to run more often on demand via
+    # workflow_dispatch if a fresh check is ever wanted sooner.
+    - cron: "0 3 * * 1"
   workflow_dispatch: {}
 
 jobs:
