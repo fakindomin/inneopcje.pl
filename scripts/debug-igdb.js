@@ -62,6 +62,13 @@ await query(
 );
 
 await query(
+  "PC(id=6) + 2023, WITH rating_count>=5 only (no category filter)",
+  "games",
+  `fields name,total_rating,total_rating_count,category; where platforms = (6) & first_release_date >= ${start2023} & first_release_date < ${end2023} & total_rating != null & total_rating_count >= 5; sort total_rating desc; limit 10;`,
+  token
+);
+
+await query(
   "PC(id=6) + 2023, WITH full current filter (rating_count>=5 & category 0/8/9)",
   "games",
   `fields name,total_rating,total_rating_count,category; where platforms = (6) & first_release_date >= ${start2023} & first_release_date < ${end2023} & total_rating != null & total_rating_count >= 5 & category = (0,8,9); sort total_rating desc; limit 10;`,
