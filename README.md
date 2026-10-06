@@ -54,8 +54,11 @@ to show "did it run today," recent history, and live status — without calling 
 Actions API.
 
 Everything is idempotent: `lib/schema.js` creates `seed_queue`, `bot_state`, and
-`bot_runs` with `CREATE TABLE IF NOT EXISTS` on every run, and makes sure the
-`telewizory` category exists, so there's no separate migration step to remember to run.
+`bot_runs` with `CREATE TABLE IF NOT EXISTS` on every run, so there's no separate
+migration step to remember to run. It no longer auto-creates a `telewizory`
+category — it used to, which actively undid deleting that category on every run
+once the site pivoted away from it; categories are the site's call now, not this
+bot's.
 
 ## Setup
 
@@ -149,6 +152,13 @@ quota doesn't come back until tomorrow); the whole run only stops with
   per wizard bucket — it doesn't yet include newer hardware released after this was
   written (e.g. a future "Switch 2"). Re-check against
   `https://api.igdb.com/v4/platforms` if `gry` coverage for a bucket looks thin.
-- IGDB's `category` field filter (`= (0,8,9)`, main game/remake/remaster) is
-  best-effort — IGDB's less common category values aren't explicitly excluded, just
-  unlikely to outrank real games on `total_rating_count`.
+  (The platform ids themselves were confirmed live and are correct - see the
+  `category` note below for a sibling filter that wasn't.)
+- `fetchTopGames` doesn't filter IGDB's `category` field (DLC/bundle/edition entries
+  can slip into results alongside real games) — a prior version tried
+  `category = (0,8,9)` to keep only main games/remakes/remasters, but live testing
+  showed that filter was simply wrong (it zeroed out every result for every
+  platform/year, including unambiguous main games) and was removed rather than
+  guessed at again. `total_rating_count >= 5` already excludes the lowest-signal
+  noise; a rare DLC/bundle entry that ranks highly just gets evaluated by Gemini
+  like any other candidate.
