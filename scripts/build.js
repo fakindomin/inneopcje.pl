@@ -1,14 +1,17 @@
 import { getPool } from "../lib/db.js";
 import { ensureSchema, isBotEnabled, pickCurrentCategory, startRun, finishRun, logSkippedRun } from "../lib/schema.js";
-import { evaluateProduct, GEMINI_CALL_DELAY_MS, sleep, isQuotaError, minAllowedReleaseYear } from "../lib/gemini.js";
+import { evaluateProduct, geminiCallDelayMs, sleep, isQuotaError, minAllowedReleaseYear } from "../lib/gemini.js";
 import { normalizeName, slugify, uniqueSlug } from "../lib/slugify.js";
 import { computeAlternatives } from "../lib/matching.js";
 import { normalizeBrand } from "../lib/brands.js";
 import { generateSeeds } from "./generate-seeds.js";
 
 // Confirmed on aistudio.google.com/rate-limit for this project:
-// gemini-3.5-flash-lite free tier = 500 RPD, 15 RPM. 450 leaves the same
-// ~10% margin odbaitujto uses for the same model/tier.
+// gemini-3.5-flash-lite free tier = 500 RPD, 15 RPM PER KEY (see
+// lib/gemini.js's key rotation — multiple GEMINI_API_KEY* multiply both
+// caps). 450 leaves a ~10% margin under one key's own daily cap; it's just
+// a per-fetch LIMIT, so build.js's outer loop re-fetches more batches in
+// the same run regardless of how many keys are configured.
 const BATCH_SIZE = 450;
 const SCORE_MIN = 1;
 const SCORE_MAX = 10;
@@ -196,7 +199,7 @@ async function processBatch(pool, category, categoryId, queue) {
       console.error(`build: failed "${item.product_name}": ${err.message}`);
     }
 
-    await sleep(GEMINI_CALL_DELAY_MS);
+    await sleep(geminiCallDelayMs());
   }
 
   return { stats, quotaExhausted, lastItemError };
@@ -231,7 +234,7 @@ async function runOneCategoryCycle(pool) {
       await finishRun(pool, runId, { status: "failed", note: err.message });
       return { didWork: false, quotaExhausted: false };
     }
-    await sleep(GEMINI_CALL_DELAY_MS);
+    await sleep(geminiCallDelayMs());
     queue = await fetchQueueBatch(pool, category);
   }
 

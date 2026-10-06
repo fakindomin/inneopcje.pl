@@ -16,7 +16,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # BATCH_SIZE=450 in scripts/build.js @ ~4.2s/call is ~32 minutes worst case.
+    # scripts/build.js's own 38-minute JOB_TIME_BUDGET_MS is the real stopping
+    # mechanism (leaves ~2 min of margin under this); this is just the hard
+    # safety ceiling. Pacing between Gemini calls scales with how many
+    # GEMINI_API_KEY* secrets are configured (lib/gemini.js's
+    # geminiCallDelayMs) — more keys means more calls fit in the same budget.
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
@@ -30,6 +34,9 @@ jobs:
       - run: npm run build
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_API_KEY_3: ${{ secrets.GEMINI_API_KEY_3 }}
+          GEMINI_API_KEY_4: ${{ secrets.GEMINI_API_KEY_4 }}
           NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
           IGDB_CLIENT_ID: ${{ secrets.IGDB_CLIENT_ID }}
           IGDB_CLIENT_SECRET: ${{ secrets.IGDB_CLIENT_SECRET }}

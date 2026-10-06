@@ -40,7 +40,8 @@ batch — it keeps looping, spending as much of the day's Gemini quota as it can
    Gemini keeps suggesting names that already exist), the job's own time budget runs out
    (38 min, under the 40-minute workflow timeout), or an absolute safety cap (200 loop
    iterations) is hit.
-3. Waits ~4.2s between individual Gemini calls throughout (free tier RPM cap).
+3. Waits a pace-dependent delay between individual Gemini calls throughout (free
+   tier RPM cap, ~4.2s at one key, less with more — see "Multiple Gemini keys" below).
 
 `bot_runs` (one row per category pass, not per cron firing) is what the admin panel reads
 to show "did it run today," recent history, and live status — without calling the GitHub
@@ -55,7 +56,8 @@ Everything is idempotent: `lib/schema.js` creates `seed_queue`, `bot_state`, and
 1. Push this repo to GitHub as **public** (required for reliable free scheduled Actions
    on a personal account).
 2. In *Settings → Secrets and variables → Actions*, add:
-   - `GEMINI_API_KEY` — a Gemini API key (Google AI Studio).
+   - `GEMINI_API_KEY` (and optionally `GEMINI_API_KEY_2`/`_3`/`_4`/…, see "Multiple
+     Gemini keys" below) — a Gemini API key (Google AI Studio).
    - `NEON_DATABASE_URL` — the **same** Neon connection string the `innaopcja.pl` site
      uses (its `DATABASE_URL` in `.env.local`). Using the same value is intentional:
      this bot writes into the live site's database.
@@ -103,6 +105,23 @@ never match any ankieta/wizard filter.
 Re-running the seed sweep (whenever `gry`'s queue empties) mostly dedupes to nothing
 new until IGDB's own rankings shift — the heavy lifting happens once, on the first
 backfill, not every week.
+
+## Multiple Gemini keys
+
+Set `GEMINI_API_KEY_2`, `_3`, `_4`, … (up to `_6`, see `KEY_ENV_NAMES` in
+`lib/gemini.js`) alongside `GEMINI_API_KEY` to multiply throughput — each is a
+separate free-tier key/project (same Google account, different projects is the normal
+way to get more than one; don't create throwaway Google accounts just to farm more
+free quota, that's the part that'd actually cross into ToS-abuse territory).
+
+Every Gemini call round-robins across whichever keys are configured
+(`callWithKeyRotation`). This multiplies both caps for the same reason: with N keys,
+each individual key is only hit every Nth call, so `geminiCallDelayMs()` divides the
+safe single-key pacing (4200ms) by N — same per-key RPM headroom, N× the total
+throughput — while the combined daily quota becomes N × 500/day. A key that hits
+`RESOURCE_EXHAUSTED` gets rotated out for the rest of that run (not retried — a daily
+quota doesn't come back until tomorrow); the whole run only stops with
+`QuotaExceededError` once every configured key is exhausted.
 
 ## Known limitations / follow-ups
 
