@@ -89,10 +89,18 @@ Unlike telefony/telewizory (seeded by asking Gemini to recall/search a name list
 `gry`'s candidates come from [IGDB](https://igdb.com) — real critic+user ratings,
 real platform/genre/release-date data, queried directly instead of trusting an LLM's
 memory of "best games of \<year\>". `scripts/generate-seeds.js`'s `generateGrySeeds`
-sweeps every (platform bucket × year) cell — 5 buckets (`lib/igdb.js`'s
-`PLATFORM_IGDB_IDS`) × the last 10 years — asking IGDB for the top 100 by rating each
+sweeps every (year × platform bucket) cell — the last 10 years × 5 buckets
+(`lib/igdb.js`'s `PLATFORM_IGDB_IDS`) — asking IGDB for the top 100 by rating each
 time, and stores each candidate's IGDB facts (platforms/genres/themes/game_modes/
 rating) in `seed_queue.source_facts` (JSONB).
+
+Deliberately **newest year first, every platform before going a year older**: each
+candidate's `seed_queue.priority` is set to its release year, and `build.js`'s
+`fetchQueueBatch` already orders by `priority DESC, created_at ASC` — so processing
+naturally fills every platform with recent titles first (breadth), only working
+backward into older years (depth) once the recent ones are done, instead of
+exhausting one platform's entire 10-year history before a second platform gets
+anything.
 
 `gry` also gets its own 10-year release-window (`minAllowedReleaseYear`), vs. the
 3-year window that fits fast-churning phones/TVs — see `CATEGORY_YEARS_BACK` in

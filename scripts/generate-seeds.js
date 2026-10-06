@@ -6,18 +6,27 @@ import { fetchTopGames, PLATFORM_IGDB_IDS, IGDB_CALL_DELAY_MS, sleep as igdbSlee
 const GRY_PLATFORMS = Object.keys(PLATFORM_IGDB_IDS); // PC, PlayStation, Xbox, Nintendo, Mobilne
 const GRY_YEARS_BACK = 10;
 
+// Newest year first - lastNYears(10)[0] is the current year.
 function lastNYears(n) {
   const currentYear = new Date().getFullYear();
-  return Array.from({ length: n }, (_, i) => currentYear - n + 1 + i);
+  return Array.from({ length: n }, (_, i) => currentYear - i);
 }
 
 // `gry` sources candidate names from IGDB's real ratings (top 100 per
 // platform per year, see lib/igdb.js) instead of asking Gemini to recall or
-// search a ranking from memory. Sweeps every (platform, year) cell once per
+// search a ranking from memory. Sweeps every (year, platform) cell once per
 // call; re-running later mostly dedupes to nothing new until IGDB's own
 // rankings shift. Each candidate's IGDB facts (platforms/genres/themes/
 // game_modes/rating) are stored alongside it in seed_queue.source_facts, fed
 // back into the Gemini evaluation prompt as grounding (see lib/gemini.js).
+//
+// Deliberately year-outer, platform-inner, newest year first: every
+// platform's top 100 for one year gets queued (and given that year as
+// `priority`) before moving to an older year. build.js's fetchQueueBatch
+// already orders by `priority DESC, created_at ASC`, so this is what makes
+// processing fill every platform with recent titles first - breadth before
+// depth - instead of exhausting one platform's entire 10-year history before
+// a second platform gets anything.
 async function generateGrySeeds(pool) {
   const [{ rows: existingProducts }, { rows: queued }] = await Promise.all([
     pool.query(
@@ -31,8 +40,8 @@ async function generateGrySeeds(pool) {
   ]);
 
   let totalQueued = 0;
-  for (const platform of GRY_PLATFORMS) {
-    for (const year of lastNYears(GRY_YEARS_BACK)) {
+  for (const year of lastNYears(GRY_YEARS_BACK)) {
+    for (const platform of GRY_PLATFORMS) {
       let games;
       try {
         games = await fetchTopGames(platform, year, 100);
@@ -47,14 +56,14 @@ async function generateGrySeeds(pool) {
         const normalized = normalizeName(game.name);
         if (!normalized || known.has(normalized)) continue;
         known.add(normalized);
-        rows.push([game.name.trim(), JSON.stringify(game)]);
+        rows.push([game.name.trim(), JSON.stringify(game), year]);
       }
       if (rows.length === 0) continue;
 
-      const values = rows.map((_, i) => `('gry', $${i * 2 + 1}, $${i * 2 + 2}::jsonb)`).join(", ");
+      const values = rows.map((_, i) => `('gry', $${i * 3 + 1}, $${i * 3 + 2}::jsonb, $${i * 3 + 3})`).join(", ");
       const params = rows.flat();
       await pool.query(
-        `INSERT INTO seed_queue (category, product_name, source_facts) VALUES ${values}
+        `INSERT INTO seed_queue (category, product_name, source_facts, priority) VALUES ${values}
          ON CONFLICT (category, product_name) DO NOTHING`,
         params
       );
@@ -63,7 +72,7 @@ async function generateGrySeeds(pool) {
   }
 
   console.log(
-    `generate-seeds(gry): queued ${totalQueued} new names from IGDB across ${GRY_PLATFORMS.length} platforms x ${GRY_YEARS_BACK} years`
+    `generate-seeds(gry): queued ${totalQueued} new names from IGDB across ${GRY_PLATFORMS.length} platforms x ${GRY_YEARS_BACK} years (newest year first, priority = release year)`
   );
   return totalQueued;
 }
