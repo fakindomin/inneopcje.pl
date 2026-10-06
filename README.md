@@ -25,11 +25,17 @@ batch — it keeps looping, spending as much of the day's Gemini quota as it can
    - Pulls up to `BATCH_SIZE` (450) `pending` rows from `seed_queue` for that category.
      If empty, asks Gemini for 40 new candidate names first (`scripts/generate-seeds.js`,
      deduped against existing products and queue rows), then re-checks.
-   - For each queued name, asks Gemini (`gemini-3.5-flash-lite`, JSON mode) to evaluate
-     it: verdict, score, summary, pros/cons, specs (always includes
-     `specs.price_pln_approx`), brand, brand recognition, price tier, and a `confidence`
-     flag. Published when `confidence` is `wysoka`, `draft` otherwise — low-confidence or
-     malformed responses never overwrite existing data.
+   - Queued names are evaluated `BATCH_EVAL_SIZE` (20) at a time, one Gemini
+     (`gemini-3.5-flash-lite`, JSON mode) call per batch instead of per name — the free
+     tier's binding constraint is requests/day (and RPM), not context window, so this
+     multiplies effective daily throughput by ~20x per key on top of whatever multiple
+     `GEMINI_API_KEY_2`/etc. already provide (see "Multiple Gemini keys" below). Each
+     title in a batch is still scored and validated independently (verdict, score,
+     summary, pros/cons, specs — always includes `specs.price_pln_approx`, brand, brand
+     recognition, price tier, and a `confidence` flag) and matched back to its
+     `seed_queue` row by the title it echoes — one bad/unmatched title in a batch only
+     fails that one row, not the rest. Published when `confidence` is `wysoka`, `draft`
+     otherwise — low-confidence or malformed responses never overwrite existing data.
    - For newly `published` products, computes up to 3 "Inna Opcja" alternatives
      (`tansza` / `wyzsza_jakosc` / `niszowa_marka`) against other published products in
      the same category — see `lib/matching.js`. A slot is left empty rather than filled

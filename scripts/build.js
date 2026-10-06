@@ -1,6 +1,13 @@
 import { getPool } from "../lib/db.js";
 import { ensureSchema, isBotEnabled, pickCurrentCategory, startRun, finishRun, logSkippedRun } from "../lib/schema.js";
-import { evaluateProduct, geminiCallDelayMs, sleep, isQuotaError, minAllowedReleaseYear } from "../lib/gemini.js";
+import {
+  evaluateProductsBatch,
+  BATCH_EVAL_SIZE,
+  geminiCallDelayMs,
+  sleep,
+  isQuotaError,
+  minAllowedReleaseYear,
+} from "../lib/gemini.js";
 import { normalizeName, slugify, uniqueSlug } from "../lib/slugify.js";
 import { computeAlternatives } from "../lib/matching.js";
 import { normalizeBrand } from "../lib/brands.js";
@@ -158,31 +165,34 @@ async function linkAlternatives(pool, categoryId, product) {
   return alternatives.length;
 }
 
-// Evaluates every item in `queue`, inserting/linking as it goes. Stops
-// immediately (leaving the rest of `queue` untouched, still 'pending') if
-// Gemini reports the daily quota is exhausted.
+function chunk(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) chunks.push(array.slice(i, i + size));
+  return chunks;
+}
+
+// Evaluates every item in `queue`, inserting/linking as it goes, BATCH_EVAL_SIZE
+// candidates per Gemini call instead of one-call-per-candidate (see
+// lib/gemini.js's evaluateProductsBatch — the free tier's binding constraint
+// is requests/day, not context window, so this multiplies effective daily
+// throughput by BATCH_EVAL_SIZE). Each item in a batch is still
+// inserted/linked/logged individually, matched back to its seed_queue row by
+// the `name` field Gemini echoes - a missing/mismatched name just fails that
+// one item, same as any other invalid-response case. Stops immediately
+// (leaving the rest of `queue` untouched, still 'pending') if Gemini reports
+// the daily quota is exhausted.
 async function processBatch(pool, category, categoryId, queue) {
   const stats = { published: 0, draft: 0, failed: 0 };
   let lastItemError = null;
   let quotaExhausted = false;
 
-  for (const item of queue) {
+  for (const group of chunk(queue, BATCH_EVAL_SIZE)) {
+    let evaluations;
     try {
-      const evaluation = await evaluateProduct(category, item.product_name, item.source_facts);
-      const error = validateEvaluation(evaluation, category);
-      if (error) throw new Error(`invalid Gemini response: ${error}`);
-
-      const status = evaluation.confidence === "wysoka" ? "published" : "draft";
-      const product = await insertProduct(pool, categoryId, item.product_name, evaluation, status);
-
-      let linked = 0;
-      if (status === "published") {
-        linked = await linkAlternatives(pool, categoryId, product);
-      }
-
-      await pool.query(`UPDATE seed_queue SET status = 'done' WHERE id = $1`, [item.id]);
-      stats[status]++;
-      console.log(`build: ${status} "${item.product_name}" -> ${product.slug} (${linked} alternatives linked)`);
+      evaluations = await evaluateProductsBatch(
+        category,
+        group.map((item) => ({ productName: item.product_name, facts: item.source_facts }))
+      );
     } catch (err) {
       if (isQuotaError(err)) {
         console.error(`build: Gemini daily quota exhausted, stopping batch early: ${err.message}`);
@@ -190,13 +200,50 @@ async function processBatch(pool, category, categoryId, queue) {
         break;
       }
 
-      await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
-        item.id,
-        err.message,
-      ]);
-      stats.failed++;
-      lastItemError = err.message;
-      console.error(`build: failed "${item.product_name}": ${err.message}`);
+      // The whole batch call failed (bad/non-array JSON, etc.) - fail every
+      // item in this group individually rather than losing them silently.
+      for (const item of group) {
+        await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
+          item.id,
+          `batch evaluation call failed: ${err.message}`,
+        ]);
+        stats.failed++;
+        lastItemError = err.message;
+        console.error(`build: batch call failed for "${item.product_name}": ${err.message}`);
+      }
+      await sleep(geminiCallDelayMs());
+      continue;
+    }
+
+    const byName = new Map(evaluations.filter((e) => e && typeof e === "object").map((e) => [e.name, e]));
+
+    for (const item of group) {
+      try {
+        const evaluation = byName.get(item.product_name);
+        if (!evaluation) throw new Error("not present in batch response");
+        const error = validateEvaluation(evaluation, category);
+        if (error) throw new Error(`invalid Gemini response: ${error}`);
+
+        const status = evaluation.confidence === "wysoka" ? "published" : "draft";
+        const product = await insertProduct(pool, categoryId, item.product_name, evaluation, status);
+
+        let linked = 0;
+        if (status === "published") {
+          linked = await linkAlternatives(pool, categoryId, product);
+        }
+
+        await pool.query(`UPDATE seed_queue SET status = 'done' WHERE id = $1`, [item.id]);
+        stats[status]++;
+        console.log(`build: ${status} "${item.product_name}" -> ${product.slug} (${linked} alternatives linked)`);
+      } catch (err) {
+        await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
+          item.id,
+          err.message,
+        ]);
+        stats.failed++;
+        lastItemError = err.message;
+        console.error(`build: failed "${item.product_name}": ${err.message}`);
+      }
     }
 
     await sleep(geminiCallDelayMs());
