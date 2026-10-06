@@ -16,6 +16,43 @@ const VALID_BRAND_RECOGNITION = new Set(["mainstream", "niche"]);
 const VALID_PRICE_TIER = new Set(["budzetowy", "sredni", "premium"]);
 const VALID_CONFIDENCE = new Set(["wysoka", "niska"]);
 
+// Must match inneopcje-admin's lib/wizardTreeGry.js question options and
+// lib/matching.js's produkcja/klimat contrast logic exactly — see the
+// rationale in lib/gemini.js's CATEGORY_SPEC_HINTS.gry.
+const GRY_PLATFORMY = new Set(["PC", "Xbox", "PlayStation", "Nintendo", "Mobilne"]);
+const GRY_TRYB = new Set(["solo", "multiplayer", "oba"]);
+const GRY_GATUNKI = new Set(["RPG", "Akcja", "Strzelanka", "Strategia", "Sportowa", "Przygodowa", "Horror"]);
+const GRY_PRODUKCJA = new Set(["AAA", "AA", "indie"]);
+const GRY_DLUGOSC = new Set(["krotka", "srednia", "dluga"]);
+const GRY_KLIMAT = new Set(["mroczny", "lekki"]);
+const GRY_OPEN_WORLD = new Set(["otwarty", "liniowy"]);
+
+// Checks the gry-specific specs shape the wizard/matching engine depend on
+// — a value outside these enums would never error, just silently never
+// match any wizard filter, so this is validated as strictly as the generic
+// fields above rather than left to Gemini's prompt instructions alone.
+function validateGrySpecs(specs) {
+  if (!Array.isArray(specs.platformy) || specs.platformy.length === 0 || !specs.platformy.every((p) => GRY_PLATFORMY.has(p))) {
+    return "invalid specs.platformy";
+  }
+  if (!GRY_TRYB.has(specs.tryb)) return "invalid specs.tryb";
+  if (!Array.isArray(specs.gatunki) || specs.gatunki.length === 0 || !specs.gatunki.every((g) => GRY_GATUNKI.has(g))) {
+    return "invalid specs.gatunki";
+  }
+  if (!GRY_PRODUKCJA.has(specs.produkcja)) return "invalid specs.produkcja";
+  if (!GRY_DLUGOSC.has(specs.dlugosc)) return "invalid specs.dlugosc";
+  if (!GRY_KLIMAT.has(specs.klimat)) return "invalid specs.klimat";
+  if (!GRY_OPEN_WORLD.has(specs.open_world)) return "invalid specs.open_world";
+  const fabula = Number(specs.fabula_score);
+  if (!Number.isInteger(fabula) || fabula < 1 || fabula > 5) return "invalid specs.fabula_score";
+  const grafika = Number(specs.grafika_score);
+  if (!Number.isInteger(grafika) || grafika < 1 || grafika > 5) return "invalid specs.grafika_score";
+  const month = Number(specs.release_month);
+  if (!Number.isInteger(month) || month < 1 || month > 12) return "invalid specs.release_month";
+  if (typeof specs.wybor_trudnosci !== "boolean") return "invalid specs.wybor_trudnosci";
+  return null;
+}
+
 // One cron firing keeps looping through categories — refilling and
 // processing batches — until it genuinely runs out of runway: the daily
 // Gemini quota, a full lap through every category with nothing new to add,
@@ -38,6 +75,10 @@ function validateEvaluation(data, category) {
   if (typeof data.specs.price_pln_approx !== "string" || !data.specs.price_pln_approx.trim()) {
     return "missing specs.price_pln_approx";
   }
+  if (category === "gry") {
+    const grySpecsError = validateGrySpecs(data.specs);
+    if (grySpecsError) return grySpecsError;
+  }
   if (typeof data.brand !== "string" || !data.brand.trim()) return "missing brand";
   const canonicalBrand = normalizeBrand(category, data.brand);
   if (!canonicalBrand) return `brand "${data.brand}" is outside the allowed list for "${category}"`;
@@ -45,7 +86,7 @@ function validateEvaluation(data, category) {
   if (!VALID_BRAND_RECOGNITION.has(data.brand_recognition)) return "invalid brand_recognition";
   if (!VALID_PRICE_TIER.has(data.price_tier)) return "invalid price_tier";
   const releaseYear = Number(data.release_year);
-  const minYear = minAllowedReleaseYear();
+  const minYear = minAllowedReleaseYear(category);
   if (!Number.isFinite(releaseYear)) return "missing release_year";
   if (releaseYear < minYear) return `release_year ${releaseYear} is older than the allowed window (${minYear}+)`;
   if (releaseYear > new Date().getFullYear() + 1) return `release_year ${releaseYear} is implausibly far in the future`;
@@ -55,7 +96,7 @@ function validateEvaluation(data, category) {
 
 async function fetchQueueBatch(pool, category) {
   const { rows } = await pool.query(
-    `SELECT id, product_name FROM seed_queue
+    `SELECT id, product_name, source_facts FROM seed_queue
      WHERE category = $1 AND status = 'pending'
      ORDER BY priority DESC, created_at ASC
      LIMIT $2`,
@@ -124,7 +165,7 @@ async function processBatch(pool, category, categoryId, queue) {
 
   for (const item of queue) {
     try {
-      const evaluation = await evaluateProduct(category, item.product_name);
+      const evaluation = await evaluateProduct(category, item.product_name, item.source_facts);
       const error = validateEvaluation(evaluation, category);
       if (error) throw new Error(`invalid Gemini response: ${error}`);
 

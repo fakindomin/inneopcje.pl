@@ -59,6 +59,10 @@ Everything is idempotent: `lib/schema.js` creates `seed_queue`, `bot_state`, and
    - `NEON_DATABASE_URL` — the **same** Neon connection string the `innaopcja.pl` site
      uses (its `DATABASE_URL` in `.env.local`). Using the same value is intentional:
      this bot writes into the live site's database.
+   - `IGDB_CLIENT_ID` / `IGDB_CLIENT_SECRET` — a free Twitch developer app
+     (dev.twitch.tv/console/apps; requires 2FA on the Twitch account). Only used by
+     the `gry` category's seed generation (see below) — telefony/telewizory don't
+     need it.
 3. The workflow runs weekly (Monday 03:00 UTC), or on demand via *Actions → Build
    product database → Run workflow*. New phone/TV models don't appear often enough to
    justify more - product prices instead refresh live, per view, in the
@@ -71,6 +75,35 @@ npm install
 node --env-file=.env scripts/build.js
 ```
 
+## The `gry` category: IGDB-sourced seeding
+
+Unlike telefony/telewizory (seeded by asking Gemini to recall/search a name list),
+`gry`'s candidates come from [IGDB](https://igdb.com) — real critic+user ratings,
+real platform/genre/release-date data, queried directly instead of trusting an LLM's
+memory of "best games of \<year\>". `scripts/generate-seeds.js`'s `generateGrySeeds`
+sweeps every (platform bucket × year) cell — 5 buckets (`lib/igdb.js`'s
+`PLATFORM_IGDB_IDS`) × the last 10 years — asking IGDB for the top 100 by rating each
+time, and stores each candidate's IGDB facts (platforms/genres/themes/game_modes/
+rating) in `seed_queue.source_facts` (JSONB).
+
+`gry` also gets its own 10-year release-window (`minAllowedReleaseYear`), vs. the
+3-year window that fits fast-churning phones/TVs — see `CATEGORY_YEARS_BACK` in
+`lib/gemini.js`.
+
+When `build.js` evaluates a queued `gry` candidate, it hands those stored IGDB facts
+to Gemini as grounding context (`buildFactsBlock`) instead of asking it to invent
+platforms/genres/release year from scratch — Gemini's job narrows to translating
+them into the wizard's fixed enums (`specs.platformy`/`tryb`/`gatunki`/`klimat`/
+`open_world`/etc. — see `CATEGORY_SPEC_HINTS.gry`) and filling in what IGDB doesn't
+have (PLN price, verdict/summary/pros/cons, produkcja AAA/AA/indie, dlugosc,
+fabula_score/grafika_score). `build.js`'s `validateGrySpecs` rejects a response whose
+specs fall outside those enums — a bad value there wouldn't error, it'd just silently
+never match any ankieta/wizard filter.
+
+Re-running the seed sweep (whenever `gry`'s queue empties) mostly dedupes to nothing
+new until IGDB's own rankings shift — the heavy lifting happens once, on the first
+backfill, not every week.
+
 ## Known limitations / follow-ups
 
 - Alternative matching only computes **outgoing** slots for the product just inserted.
@@ -79,3 +112,10 @@ node --env-file=.env scripts/build.js
 - `draft` products (low Gemini confidence) are never surfaced by the site
   (`status = 'published'` is required everywhere) and are never used as alternative
   candidates. They just sit in the database for manual review/promotion.
+- `PLATFORM_IGDB_IDS` (`lib/igdb.js`) is a hand-maintained list of IGDB platform ids
+  per wizard bucket — it doesn't yet include newer hardware released after this was
+  written (e.g. a future "Switch 2"). Re-check against
+  `https://api.igdb.com/v4/platforms` if `gry` coverage for a bucket looks thin.
+- IGDB's `category` field filter (`= (0,8,9)`, main game/remake/remaster) is
+  best-effort — IGDB's less common category values aren't explicitly excluded, just
+  unlikely to outrank real games on `total_rating_count`.
