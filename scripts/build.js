@@ -36,6 +36,7 @@ const GRY_PRODUKCJA = new Set(["AAA", "AA", "indie"]);
 const GRY_DLUGOSC = new Set(["krotka", "srednia", "dluga"]);
 const GRY_KLIMAT = new Set(["mroczny", "lekki"]);
 const GRY_OPEN_WORLD = new Set(["otwarty", "liniowy"]);
+const GRY_PERSPEKTYWA = new Set(["FPP", "TPP", "izometryczna", "platformowka_2d", "inna"]);
 
 // Checks the gry-specific specs shape the wizard/matching engine depend on
 // — a value outside these enums would never error, just silently never
@@ -53,6 +54,7 @@ function validateGrySpecs(specs) {
   if (!GRY_DLUGOSC.has(specs.dlugosc)) return "invalid specs.dlugosc";
   if (!GRY_KLIMAT.has(specs.klimat)) return "invalid specs.klimat";
   if (!GRY_OPEN_WORLD.has(specs.open_world)) return "invalid specs.open_world";
+  if (!GRY_PERSPEKTYWA.has(specs.perspektywa)) return "invalid specs.perspektywa";
   const fabula = Number(specs.fabula_score);
   if (!Number.isInteger(fabula) || fabula < 1 || fabula > 5) return "invalid specs.fabula_score";
   const grafika = Number(specs.grafika_score);
