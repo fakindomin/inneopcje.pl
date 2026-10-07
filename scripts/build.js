@@ -171,56 +171,102 @@ function chunk(array, size) {
   return chunks;
 }
 
-// Evaluates every item in `queue`, inserting/linking as it goes, BATCH_EVAL_SIZE
-// candidates per Gemini call instead of one-call-per-candidate (see
-// lib/gemini.js's evaluateProductsBatch — the free tier's binding constraint
-// is requests/day, not context window, so this multiplies effective daily
-// throughput by BATCH_EVAL_SIZE). Each item in a batch is still
-// inserted/linked/logged individually, matched back to its seed_queue row by
-// the `name` field Gemini echoes - a missing/mismatched name just fails that
-// one item, same as any other invalid-response case. Stops immediately
-// (leaving the rest of `queue` untouched, still 'pending') if Gemini reports
-// the daily quota is exhausted.
+// Evaluates `group` via one evaluateProductsBatch call, then recursively
+// halves and retries whatever didn't come back cleanly - either the whole
+// call failed (bad/non-array JSON, a truncated response) or it returned a
+// valid array missing some names - down to individual items if needed.
+// There's no "right" BATCH_EVAL_SIZE to hardcode: how many full records
+// (verdict/summary/pros/cons/specs each) fit before a response gets cut off
+// depends on how verbose each one turns out, which varies per batch. This
+// makes the actual safe size self-discover per call instead of guessing a
+// constant that either wastes headroom (too small) or routinely truncates
+// (too large, as BATCH_EVAL_SIZE=20 did in practice). Returns
+// Map<product_name, { evaluation } | { error }>. A QuotaExceededError
+// propagates immediately instead of being treated as "this group failed" -
+// splitting and retrying against an exhausted key can't possibly help.
+async function evaluateGroupAdaptively(category, group) {
+  const results = new Map();
+  if (group.length === 0) return results;
+
+  let evaluations = [];
+  try {
+    evaluations = await evaluateProductsBatch(
+      category,
+      group.map((item) => ({ productName: item.product_name, facts: item.source_facts }))
+    );
+  } catch (err) {
+    if (isQuotaError(err)) throw err;
+    console.warn(`build: batch of ${group.length} failed (${err.message}), splitting and retrying`);
+    evaluations = []; // treated as "every item in this group came back missing" below
+  }
+
+  const byName = new Map(
+    Array.isArray(evaluations) ? evaluations.filter((e) => e && typeof e === "object").map((e) => [e.name, e]) : []
+  );
+
+  const missing = [];
+  for (const item of group) {
+    const evaluation = byName.get(item.product_name);
+    if (evaluation) results.set(item.product_name, { evaluation });
+    else missing.push(item);
+  }
+
+  if (missing.length === 0) return results;
+
+  // Already at the smallest possible group and it still came back missing
+  // - nowhere left to split to, this is a genuine permanent failure.
+  if (group.length === 1) {
+    results.set(missing[0].product_name, { error: "not present in batch response (even alone)" });
+    return results;
+  }
+
+  // Split whatever's still missing and retry - even a single straggler
+  // from an otherwise-successful larger group gets one more solo attempt
+  // instead of being given up on immediately, since a lone miss might
+  // just be a fluke that a fresh, lower-pressure retry clears.
+  const mid = Math.max(1, Math.ceil(missing.length / 2));
+  await sleep(geminiCallDelayMs());
+  const firstHalf = await evaluateGroupAdaptively(category, missing.slice(0, mid));
+  for (const [name, result] of firstHalf) results.set(name, result);
+  if (missing.length > mid) {
+    await sleep(geminiCallDelayMs());
+    const secondHalf = await evaluateGroupAdaptively(category, missing.slice(mid));
+    for (const [name, result] of secondHalf) results.set(name, result);
+  }
+  return results;
+}
+
+// Evaluates every item in `queue`, inserting/linking as it goes,
+// BATCH_EVAL_SIZE candidates per initial Gemini call instead of one call
+// per candidate (see lib/gemini.js's evaluateProductsBatch — the free
+// tier's binding constraint is requests/day, not context window, so this
+// multiplies effective daily throughput). evaluateGroupAdaptively handles
+// a group that doesn't come back cleanly by splitting and retrying smaller
+// pieces, so a single bad/truncated response doesn't cost the whole group.
+// Stops immediately (leaving the rest of `queue` untouched, still
+// 'pending') if Gemini reports the daily quota is exhausted.
 async function processBatch(pool, category, categoryId, queue) {
   const stats = { published: 0, draft: 0, failed: 0 };
   let lastItemError = null;
   let quotaExhausted = false;
 
   for (const group of chunk(queue, BATCH_EVAL_SIZE)) {
-    let evaluations;
+    let results;
     try {
-      evaluations = await evaluateProductsBatch(
-        category,
-        group.map((item) => ({ productName: item.product_name, facts: item.source_facts }))
-      );
+      results = await evaluateGroupAdaptively(category, group);
     } catch (err) {
-      if (isQuotaError(err)) {
-        console.error(`build: Gemini daily quota exhausted, stopping batch early: ${err.message}`);
-        quotaExhausted = true;
-        break;
-      }
-
-      // The whole batch call failed (bad/non-array JSON, etc.) - fail every
-      // item in this group individually rather than losing them silently.
-      for (const item of group) {
-        await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
-          item.id,
-          `batch evaluation call failed: ${err.message}`,
-        ]);
-        stats.failed++;
-        lastItemError = err.message;
-        console.error(`build: batch call failed for "${item.product_name}": ${err.message}`);
-      }
-      await sleep(geminiCallDelayMs());
-      continue;
+      console.error(`build: Gemini daily quota exhausted, stopping batch early: ${err.message}`);
+      quotaExhausted = true;
+      break;
     }
-
-    const byName = new Map(evaluations.filter((e) => e && typeof e === "object").map((e) => [e.name, e]));
 
     for (const item of group) {
       try {
-        const evaluation = byName.get(item.product_name);
-        if (!evaluation) throw new Error("not present in batch response");
+        const result = results.get(item.product_name);
+        if (!result) throw new Error("not present in batch response");
+        if (result.error) throw new Error(result.error);
+        const evaluation = result.evaluation;
+
         const error = validateEvaluation(evaluation, category);
         if (error) throw new Error(`invalid Gemini response: ${error}`);
 
