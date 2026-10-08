@@ -2,15 +2,19 @@ name: Build product database
 
 on:
   schedule:
-    # Weekly, not hourly - new phone/TV models don't appear often enough to
-    # justify spending Gemini quota checking for them every hour (that
-    # budget is better spent on the live per-view price refresh instead,
-    # see app/api/phone/[slug]/price/route.js in the innaopcja.pl repo).
-    # Runs Monday at 03:00 UTC, low-traffic and no particular deadline to
-    # hit - unlike the price refresh, discovery has no reason to land at
-    # any specific time. Still fine to run more often on demand via
-    # workflow_dispatch if a fresh check is ever wanted sooner.
-    - cron: "0 3 * * 1"
+    # Daily, not weekly - the weekly cadence made sense for telefony/telewizory
+    # (there, the only job is checking IGDB/Gemini for NEW models, which don't
+    # appear often enough to justify running more). gry is a different shape
+    # of problem: generate-seeds.js already swept IGDB ONCE and queued its
+    # entire catalog (thousands of titles, zero Gemini cost - that's pure
+    # IGDB API) into seed_queue, where it just sits as 'pending' until
+    # evaluated. Each run only gets through ~450 of them in its 38-minute
+    # budget (lib/gemini.js's evaluateProductsBatch is the throughput limit,
+    # not candidate discovery), so a week between runs mostly means a huge
+    # backlog sitting idle for no reason, not "waiting for new games to
+    # exist". Runs daily at 03:00 UTC; still fine to trigger via
+    # workflow_dispatch on demand too.
+    - cron: "0 3 * * *"
   workflow_dispatch: {}
 
 jobs:
