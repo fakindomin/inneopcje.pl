@@ -4,6 +4,8 @@ import {
   evaluateProductsBatch,
   BATCH_EVAL_SIZE,
   geminiCallDelayMs,
+  perKeyCallIntervalMs,
+  keyCount,
   sleep,
   isQuotaError,
   minAllowedReleaseYear,
@@ -238,63 +240,84 @@ async function evaluateGroupAdaptively(category, group) {
   return results;
 }
 
+// One group's worth of DB writes (insert/link/seed_queue update), shared by
+// both a successfully-evaluated group and nothing else - a group whose
+// Gemini call itself rejected (quota exhausted) never reaches this, its
+// items are left untouched ('pending') for a future run instead.
+async function writeGroupResults(pool, category, categoryId, group, results, stats, onItemError) {
+  for (const item of group) {
+    try {
+      const result = results.get(item.product_name);
+      if (!result) throw new Error("not present in batch response");
+      if (result.error) throw new Error(result.error);
+      const evaluation = result.evaluation;
+
+      const error = validateEvaluation(evaluation, category);
+      if (error) throw new Error(`invalid Gemini response: ${error}`);
+
+      const status = evaluation.confidence === "wysoka" ? "published" : "draft";
+      const product = await insertProduct(pool, categoryId, item.product_name, evaluation, status);
+
+      let linked = 0;
+      if (status === "published") {
+        linked = await linkAlternatives(pool, categoryId, product);
+      }
+
+      await pool.query(`UPDATE seed_queue SET status = 'done' WHERE id = $1`, [item.id]);
+      stats[status]++;
+      console.log(`build: ${status} "${item.product_name}" -> ${product.slug} (${linked} alternatives linked)`);
+    } catch (err) {
+      await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [item.id, err.message]);
+      stats.failed++;
+      onItemError(err.message);
+      console.error(`build: failed "${item.product_name}": ${err.message}`);
+    }
+  }
+}
+
 // Evaluates every item in `queue`, inserting/linking as it goes,
-// BATCH_EVAL_SIZE candidates per initial Gemini call instead of one call
-// per candidate (see lib/gemini.js's evaluateProductsBatch — the free
-// tier's binding constraint is requests/day, not context window, so this
-// multiplies effective daily throughput). evaluateGroupAdaptively handles
-// a group that doesn't come back cleanly by splitting and retrying smaller
-// pieces, so a single bad/truncated response doesn't cost the whole group.
-// Stops immediately (leaving the rest of `queue` untouched, still
-// 'pending') if Gemini reports the daily quota is exhausted.
+// BATCH_EVAL_SIZE candidates per Gemini call instead of one call per
+// candidate (see lib/gemini.js's evaluateProductsBatch — the free tier's
+// binding constraint is requests/day and requests/minute, not context
+// window, so this multiplies effective throughput). Groups of BATCH_EVAL_SIZE
+// are further run `keyCount()` AT A TIME, one concurrent call per configured
+// GEMINI_API_KEY* — a single batch call is model-latency-bound (several
+// seconds of actual generation, not just the rate-limit gap), so with
+// multiple independent keys the real lever is parallelism, not a bigger
+// per-call batch. evaluateGroupAdaptively handles a group that doesn't come
+// back cleanly by splitting and retrying smaller pieces internally, so a
+// single bad/truncated response doesn't cost its whole group - it only ever
+// rejects this call with QuotaExceededError, meaning every configured key
+// was exhausted by the time it ran (see callWithKeyRotation). That group's
+// items are left untouched (still 'pending') for a future run; whatever
+// else in the same round succeeded is kept.
 async function processBatch(pool, category, categoryId, queue) {
   const stats = { published: 0, draft: 0, failed: 0 };
   let lastItemError = null;
   let quotaExhausted = false;
 
-  for (const group of chunk(queue, BATCH_EVAL_SIZE)) {
-    let results;
-    try {
-      results = await evaluateGroupAdaptively(category, group);
-    } catch (err) {
-      console.error(`build: Gemini daily quota exhausted, stopping batch early: ${err.message}`);
-      quotaExhausted = true;
-      break;
-    }
+  const concurrency = Math.max(1, keyCount());
+  const groups = chunk(queue, BATCH_EVAL_SIZE);
 
-    for (const item of group) {
-      try {
-        const result = results.get(item.product_name);
-        if (!result) throw new Error("not present in batch response");
-        if (result.error) throw new Error(result.error);
-        const evaluation = result.evaluation;
+  for (let i = 0; i < groups.length && !quotaExhausted; i += concurrency) {
+    const round = groups.slice(i, i + concurrency);
+    const settled = await Promise.allSettled(round.map((group) => evaluateGroupAdaptively(category, group)));
 
-        const error = validateEvaluation(evaluation, category);
-        if (error) throw new Error(`invalid Gemini response: ${error}`);
-
-        const status = evaluation.confidence === "wysoka" ? "published" : "draft";
-        const product = await insertProduct(pool, categoryId, item.product_name, evaluation, status);
-
-        let linked = 0;
-        if (status === "published") {
-          linked = await linkAlternatives(pool, categoryId, product);
-        }
-
-        await pool.query(`UPDATE seed_queue SET status = 'done' WHERE id = $1`, [item.id]);
-        stats[status]++;
-        console.log(`build: ${status} "${item.product_name}" -> ${product.slug} (${linked} alternatives linked)`);
-      } catch (err) {
-        await pool.query(`UPDATE seed_queue SET status = 'failed', last_error = $2 WHERE id = $1`, [
-          item.id,
-          err.message,
-        ]);
-        stats.failed++;
-        lastItemError = err.message;
-        console.error(`build: failed "${item.product_name}": ${err.message}`);
+    for (let g = 0; g < round.length; g++) {
+      const outcome = settled[g];
+      if (outcome.status === "rejected") {
+        console.error(
+          `build: Gemini daily quota exhausted, leaving ${round[g].length} items pending: ${outcome.reason.message}`
+        );
+        quotaExhausted = true;
+        continue;
       }
+      await writeGroupResults(pool, category, categoryId, round[g], outcome.value, stats, (msg) => {
+        lastItemError = msg;
+      });
     }
 
-    await sleep(geminiCallDelayMs());
+    if (!quotaExhausted && i + concurrency < groups.length) await sleep(perKeyCallIntervalMs());
   }
 
   return { stats, quotaExhausted, lastItemError };
