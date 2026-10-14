@@ -45,7 +45,7 @@ function lastNYears(n) {
 // page comes back shorter than GRY_PAGE_SIZE (IGDB's own signal that
 // bucket's filtered results are exhausted) or GRY_MAX_PAGES_PER_BUCKET is
 // hit (safety cap, not an expected steady-state - see its own comment).
-async function generateGrySeeds(pool) {
+async function generateGrySeeds(pool, deadline) {
   const [{ rows: existingProducts }, { rows: queued }] = await Promise.all([
     pool.query(
       `SELECT normalized_name FROM products p JOIN categories c ON c.id = p.category_id WHERE c.slug = 'gry'`
@@ -58,8 +58,19 @@ async function generateGrySeeds(pool) {
   ]);
 
   let totalQueued = 0;
-  for (const year of lastNYears(GRY_YEARS_BACK)) {
+  outer: for (const year of lastNYears(GRY_YEARS_BACK)) {
     for (const platform of GRY_PLATFORMS) {
+      // Same reasoning as scripts/build.js's processBatch deadline check -
+      // up to 20 pages x 50 (platform, year) buckets is a lot of IGDB round
+      // trips, and this runs inside the same job's time budget as the
+      // actual Gemini evaluation that follows it. Bailing out here (instead
+      // of running the full sweep to completion no matter how long it
+      // takes) leaves that budget intact for processBatch, and the sweep
+      // picks up wherever it left off next time the queue runs dry anyway.
+      if (deadline && Date.now() > deadline) {
+        console.log(`generate-seeds(gry): approaching the job's time budget, stopping the IGDB sweep early`);
+        break outer;
+      }
       for (let page = 0; page < GRY_MAX_PAGES_PER_BUCKET; page++) {
         let games;
         try {
@@ -104,8 +115,8 @@ async function generateGrySeeds(pool) {
 
 // Refills seed_queue with new candidate product names for `category`.
 // Dedupes against products already in the DB and rows already queued.
-export async function generateSeeds(pool, category) {
-  if (category === "gry") return generateGrySeeds(pool);
+export async function generateSeeds(pool, category, deadline) {
+  if (category === "gry") return generateGrySeeds(pool, deadline);
 
   const names = await generateSeedNames(category);
 

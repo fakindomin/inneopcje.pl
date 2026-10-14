@@ -291,15 +291,33 @@ async function writeGroupResults(pool, category, categoryId, group, results, sta
 // was exhausted by the time it ran (see callWithKeyRotation). That group's
 // items are left untouched (still 'pending') for a future run; whatever
 // else in the same round succeeded is kept.
-async function processBatch(pool, category, categoryId, queue) {
+async function processBatch(pool, category, categoryId, queue, deadline) {
   const stats = { published: 0, draft: 0, failed: 0 };
   let lastItemError = null;
   let quotaExhausted = false;
+  let timeBudgetExhausted = false;
 
   const concurrency = Math.max(1, keyCount());
   const groups = chunk(queue, BATCH_EVAL_SIZE);
 
   for (let i = 0; i < groups.length && !quotaExhausted; i += concurrency) {
+    // A single call to this function used to run every group in `queue` to
+    // completion regardless of elapsed time - run()'s own JOB_TIME_BUDGET_MS
+    // check only happens BETWEEN category cycles, so one long processBatch
+    // call (a full BATCH_SIZE=450-item queue, each round taking up to a
+    // minute of real Gemini generation time) could itself overrun the job's
+    // 40-minute hard timeout and get forcibly cancelled mid-write - orphaning
+    // this run's bot_runs row as 'running' forever instead of finishing
+    // cleanly (confirmed live: two runs cancelled at exactly 40:0x). Leaving
+    // the rest of `queue` untouched ('pending') and returning early, same as
+    // a quota exhaustion, lets runOneCategoryCycle/run() close this out
+    // gracefully with time to spare instead.
+    if (Date.now() > deadline) {
+      console.log(`build: approaching the job's time budget mid-batch, leaving ${queue.length - i} items pending`);
+      timeBudgetExhausted = true;
+      break;
+    }
+
     const round = groups.slice(i, i + concurrency);
     const settled = await Promise.allSettled(round.map((group) => evaluateGroupAdaptively(category, group)));
 
@@ -320,14 +338,14 @@ async function processBatch(pool, category, categoryId, queue) {
     if (!quotaExhausted && i + concurrency < groups.length) await sleep(perKeyCallIntervalMs());
   }
 
-  return { stats, quotaExhausted, lastItemError };
+  return { stats, quotaExhausted, timeBudgetExhausted, lastItemError };
 }
 
 // One category's worth of work for this pass: refill the queue if empty,
 // process whatever's there, log a bot_runs row. Returns whether it actually
 // did anything (so the outer loop can tell "nothing left anywhere" apart
 // from "just this category was empty") and whether quota ran out.
-async function runOneCategoryCycle(pool) {
+async function runOneCategoryCycle(pool, deadline) {
   const category = await pickCurrentCategory(pool);
   const { rows: categoryRows } = await pool.query(`SELECT id FROM categories WHERE slug = $1`, [category]);
   const categoryId = categoryRows[0]?.id;
@@ -342,7 +360,7 @@ async function runOneCategoryCycle(pool) {
   let queue = await fetchQueueBatch(pool, category);
   if (queue.length === 0) {
     try {
-      await generateSeeds(pool, category);
+      await generateSeeds(pool, category, deadline);
     } catch (err) {
       if (isQuotaError(err)) {
         await finishRun(pool, runId, { status: "failed", note: err.message });
@@ -362,7 +380,13 @@ async function runOneCategoryCycle(pool) {
     return { didWork: false, quotaExhausted: false };
   }
 
-  const { stats, quotaExhausted, lastItemError } = await processBatch(pool, category, categoryId, queue);
+  const { stats, quotaExhausted, timeBudgetExhausted, lastItemError } = await processBatch(
+    pool,
+    category,
+    categoryId,
+    queue,
+    deadline
+  );
 
   console.log(`build: "${category}" done — published=${stats.published} draft=${stats.draft} failed=${stats.failed}`);
   await finishRun(pool, runId, {
@@ -370,12 +394,14 @@ async function runOneCategoryCycle(pool) {
     ...stats,
     note: quotaExhausted
       ? "Gemini: wyczerpany dzienny limit (RESOURCE_EXHAUSTED) — przerwano cykl wcześniej, reszta kolejki zostaje w 'pending'"
+      : timeBudgetExhausted
+      ? "zbliżający się limit czasu joba — przerwano cykl wcześniej, reszta kolejki zostaje w 'pending'"
       : stats.failed > 0
       ? `ostatni błąd pozycji: ${lastItemError}`
       : null,
   });
 
-  return { didWork: true, quotaExhausted };
+  return { didWork: true, quotaExhausted, timeBudgetExhausted };
 }
 
 async function run() {
@@ -394,6 +420,7 @@ async function run() {
     const categoryCount = Math.max(categoryRows.length, 1);
 
     const jobStart = Date.now();
+    const deadline = jobStart + JOB_TIME_BUDGET_MS;
     let consecutiveEmptyCycles = 0;
     let iterations = 0;
 
@@ -403,7 +430,7 @@ async function run() {
         console.log("build: hit the absolute iteration safety cap, stopping");
         break;
       }
-      if (Date.now() - jobStart > JOB_TIME_BUDGET_MS) {
+      if (Date.now() > deadline) {
         console.log("build: approaching the job's time budget, stopping cleanly");
         break;
       }
@@ -412,10 +439,14 @@ async function run() {
         break;
       }
 
-      const { didWork, quotaExhausted } = await runOneCategoryCycle(pool);
+      const { didWork, quotaExhausted, timeBudgetExhausted } = await runOneCategoryCycle(pool, deadline);
 
       if (quotaExhausted) {
         console.log("build: stopping — Gemini daily quota exhausted");
+        break;
+      }
+      if (timeBudgetExhausted) {
+        console.log("build: stopping — hit the job's time budget mid-cycle");
         break;
       }
 
