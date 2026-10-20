@@ -150,11 +150,32 @@ async function insertProduct(pool, categoryId, name, evaluation, status) {
   return rows[0];
 }
 
+// Pushes the SAME gatunek/perspektywa hard filters matching.js's
+// sharesGenre/sharesPerspective apply in JS into this query, plus a LIMIT
+// 300 safety cap - mirrors inneopcje-admin's lib/queries.js getAlternatives
+// fix. This runs once per NEWLY PUBLISHED game (every bot run inserts
+// dozens to hundreds), and before this fix it fetched the ENTIRE published
+// catalog's specs every single time regardless of genre/perspective match,
+// even though computeAlternatives immediately discards anything that
+// doesn't share those - an O(catalog size) transfer per insert that only
+// gets worse as the catalog grows, confirmed as the dominant remaining
+// driver behind this project's Neon egress overage (see lib/queries.js's
+// getAlternatives and lib/wizardMatchGry.js's matchGre, already fixed
+// there for the site-facing paths - this is the equivalent fix for the
+// bot's own insert-time path).
 async function linkAlternatives(pool, categoryId, product) {
+  const gatunki = Array.isArray(product.specs?.gatunki) ? product.specs.gatunki : null;
+  const perspektywa = product.specs?.perspektywa ?? null;
+
   const { rows: candidates } = await pool.query(
     `SELECT id, slug, name, brand, brand_recognition, score, price_tier, specs
-     FROM products WHERE category_id = $1 AND status = 'published' AND id <> $2`,
-    [categoryId, product.id]
+     FROM products
+     WHERE category_id = $1 AND status = 'published' AND id <> $2
+       AND ($3::text[] IS NULL OR specs->'gatunki' ?| $3::text[])
+       AND ($4::text IS NULL OR specs->>'perspektywa' IS NULL OR specs->>'perspektywa' = $4)
+     ORDER BY score DESC
+     LIMIT 300`,
+    [categoryId, product.id, gatunki, perspektywa]
   );
 
   const alternatives = computeAlternatives(product, candidates);
